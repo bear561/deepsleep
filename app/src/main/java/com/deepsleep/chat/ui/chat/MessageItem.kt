@@ -9,6 +9,8 @@ import android.widget.Toast
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -19,6 +21,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
@@ -73,6 +76,7 @@ fun MessageItem(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun UserMessage(
     message: ChatMessage,
@@ -81,6 +85,15 @@ private fun UserMessage(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
+    var previewAttachment by remember(message.id) {
+        mutableStateOf<com.deepsleep.chat.domain.model.Attachment?>(null)
+    }
+    val imageAttachments = remember(message.attachments) {
+        message.attachments.filter { it.isImage }
+    }
+    val textAttachments = remember(message.attachments) {
+        message.attachments.filterNot { it.isImage }
+    }
     Column(
         modifier = modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.End,
@@ -91,8 +104,28 @@ private fun UserMessage(
             modifier = Modifier.widthIn(max = 330.dp),
         ) {
             Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-                if (message.attachments.isNotEmpty()) {
-                    message.attachments.forEach { attachment ->
+                if (imageAttachments.isNotEmpty()) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        maxItemsInEachRow = 2,
+                    ) {
+                        imageAttachments.forEach { attachment ->
+                            LocalAttachmentImage(
+                                attachment = attachment,
+                                modifier = Modifier
+                                    .size(120.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable { previewAttachment = attachment },
+                            )
+                        }
+                    }
+                    if (message.content.isNotBlank() || textAttachments.isNotEmpty()) {
+                        Spacer(modifier = Modifier.size(6.dp))
+                    }
+                }
+                if (textAttachments.isNotEmpty()) {
+                    textAttachments.forEach { attachment ->
                         Text(
                             text = "附件：${attachment.name}",
                             style = MaterialTheme.typography.labelSmall,
@@ -111,6 +144,12 @@ private fun UserMessage(
                     }
                 }
             }
+        }
+        previewAttachment?.let { attachment ->
+            AttachmentPreviewDialog(
+                attachment = attachment,
+                onDismiss = { previewAttachment = null },
+            )
         }
         if (!isGenerating) {
             Row(

@@ -5,6 +5,7 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import com.deepsleep.chat.domain.model.AppSettings
 import com.deepsleep.chat.domain.model.SearchConfig
@@ -29,6 +30,10 @@ class SettingsStore(
     private val searchConfigKey = stringPreferencesKey("search_config")
     private val searchApiKeyKey = stringPreferencesKey("search_api_key")
     private val onboardingKey = booleanPreferencesKey("onboarding_completed")
+    private val updateRepoKey = stringPreferencesKey("update_repo")
+    private val updateManifestUrlKey = stringPreferencesKey("update_manifest_url")
+    private val autoCheckUpdatesKey = booleanPreferencesKey("auto_check_updates")
+    private val lastUpdateCheckKey = longPreferencesKey("last_update_check_at")
 
     val settings: Flow<AppSettings> = context.appDataStore.data
         .catch { emit(emptyPreferences()) }
@@ -44,6 +49,12 @@ class SettingsStore(
                 } ?: SearchConfig(),
                 searchHasKey = prefs[searchApiKeyKey] != null,
                 onboardingCompleted = prefs[onboardingKey] ?: false,
+                updateRepo = prefs[updateRepoKey]
+                    ?.takeIf { it.isNotBlank() }
+                    ?: AppSettings.DEFAULT_UPDATE_REPO,
+                updateManifestUrl = prefs[updateManifestUrlKey].orEmpty(),
+                autoCheckUpdates = prefs[autoCheckUpdatesKey] ?: true,
+                lastUpdateCheckAt = prefs[lastUpdateCheckKey] ?: 0L,
             )
         }
 
@@ -87,6 +98,25 @@ class SettingsStore(
 
     suspend fun setOnboardingCompleted() {
         context.appDataStore.edit { it[onboardingKey] = true }
+    }
+
+    suspend fun setUpdateRepo(repo: String) {
+        context.appDataStore.edit { it[updateRepoKey] = repo.trim() }
+    }
+
+    suspend fun setUpdateManifestUrl(url: String) {
+        context.appDataStore.edit { prefs ->
+            val value = url.trim()
+            if (value.isEmpty()) prefs.remove(updateManifestUrlKey) else prefs[updateManifestUrlKey] = value
+        }
+    }
+
+    suspend fun setAutoCheckUpdates(enabled: Boolean) {
+        context.appDataStore.edit { it[autoCheckUpdatesKey] = enabled }
+    }
+
+    suspend fun setLastUpdateCheckAt(timestamp: Long) {
+        context.appDataStore.edit { it[lastUpdateCheckKey] = timestamp }
     }
 
     companion object {

@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.speech.RecognizerIntent
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
@@ -53,7 +54,6 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -76,7 +76,8 @@ import com.deepsleep.chat.R
 import com.deepsleep.chat.di.AppContainer
 import com.deepsleep.chat.domain.model.ChatMessage
 import com.deepsleep.chat.domain.model.MessageRole
-import com.deepsleep.chat.ui.chat.voice.SpeechInputController
+import com.deepsleep.chat.domain.model.TextLimits
+import com.deepsleep.chat.ui.chat.voice.VoicePhase
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -104,8 +105,6 @@ fun ChatScreen(
     var showModelPicker by rememberSaveable { mutableStateOf(false) }
     var showSearchSetup by remember { mutableStateOf(false) }
     var editTarget by remember { mutableStateOf<ChatMessage?>(null) }
-    var isListening by remember { mutableStateOf(false) }
-    var voicePartial by remember { mutableStateOf("") }
 
     // The message list uses reverseLayout: index 0 is the newest item at the bottom.
 // While a message grows, the bottom edge stays anchored, so we do NOT scroll on
@@ -127,7 +126,15 @@ fun ChatScreen(
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(viewModel::addAttachment)
     }
+    val imagePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(TextLimits.MAX_IMAGES_PER_MESSAGE),
+    ) { uris ->
+        viewModel.addImageAttachments(uris)
+    }
 
+    // Some ROMs expose only a recognition activity, not a RecognitionService.
+    // Keep it as the last-resort fallback before telling the user to configure
+    // cloud transcription.
     val voiceIntent = remember {
         Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -148,44 +155,19 @@ fun ChatScreen(
             if (text.isNotEmpty()) viewModel.appendVoiceText(text)
         }
     }
-    val voiceController = remember(context) {
-        SpeechInputController(
-            context = context,
-            onPartial = { voicePartial = it },
-            onFinal = { text ->
-                voicePartial = ""
-                isListening = false
-                viewModel.appendVoiceText(text)
-            },
-            onError = { message ->
-                voicePartial = ""
-                isListening = false
-                viewModel.showError(message)
-            },
-            onListeningChanged = { isListening = it },
-        )
-    }
-    DisposableEffect(voiceController) {
-        onDispose { voiceController.destroy() }
-    }
     val micPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
         if (granted) {
-            if (voiceController.isAvailable()) {
-                voiceController.start()
-            } else if (voiceIntent.resolveActivity(context.packageManager) != null) {
-                voiceLauncher.launch(voiceIntent)
-            } else {
-                viewModel.showError("系统没有可用的语音识别服务，可使用输入法的语音键")
-            }
+            viewModel.showWarning("已获得麦克风权限，请按住麦克风说话")
         } else {
             viewModel.showError("需要麦克风权限才能语音输入")
         }
     }
-    val launchVoice = {
-        if (isListening) {
-            voiceController.stop()
+    val canTranscribe = !state.activeProvider?.transcriptionModelId.isNullOrBlank()
+    val pressVoice: () -> Unit = {
+        if (state.isStreaming) {
+            Unit
         } else {
             val granted = ContextCompat.checkSelfPermission(
                 context,
@@ -193,15 +175,16 @@ fun ChatScreen(
             ) == PackageManager.PERMISSION_GRANTED
             when {
                 !granted -> micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                voiceController.isAvailable() -> voiceController.start()
+                viewModel.hasSystemSpeechService() || canTranscribe -> viewModel.startVoiceInput()
                 voiceIntent.resolveActivity(context.packageManager) != null -> {
                     runCatching { voiceLauncher.launch(voiceIntent) }
                         .onFailure { viewModel.showError("无法启动语音识别") }
                 }
-                else -> viewModel.showError("未找到系统语音识别服务，可使用输入法的语音键")
+                else -> viewModel.startVoiceInput()
             }
         }
     }
+    val releaseVoice: () -> Unit = { viewModel.stopVoiceInput() }
 
     val closeDrawerThen: (() -> Unit) -> Unit = { action ->
         scope.launch {
@@ -301,10 +284,10 @@ fun ChatScreen(
                             .navigationBarsPadding()
                             .imePadding(),
                     ) {
-                        if (isListening) {
-                            ListeningBar(
-                                partial = voicePartial,
-                                onStop = { voiceController.stop() },
+                        if (state.voicePhase != VoicePhase.IDLE) {
+                            VoiceBar(
+                                phase = state.voicePhase,
+                                partial = state.voicePartial,
                             )
                         }
                         Composer(
@@ -320,10 +303,15 @@ fun ChatScreen(
                                     viewModel.toggleWebSearch()
                                 }
                             },
-                            onAttach = { filePicker.launch(arrayOf("text/*")) },
+                            onPickImages = {
+                                imagePicker.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                                )
+                            },
+                            onPickFile = { filePicker.launch(arrayOf("text/*")) },
                             onRemoveAttachment = viewModel::removeAttachment,
-                            onVoice = { launchVoice() },
-                            listening = isListening,
+                            onVoicePress = pressVoice,
+                            onVoiceRelease = releaseVoice,
                         )
                     }
                 }
@@ -586,16 +574,16 @@ fun ChatScreen(
 }
 
 @Composable
-private fun ListeningBar(
+private fun VoiceBar(
+    phase: VoicePhase,
     partial: String,
-    onStop: () -> Unit,
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         color = MaterialTheme.colorScheme.primaryContainer,
     ) {
         Row(
-            modifier = Modifier.padding(start = 14.dp, end = 4.dp, top = 5.dp, bottom = 5.dp),
+            modifier = Modifier.padding(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             CircularProgressIndicator(
@@ -606,13 +594,25 @@ private fun ListeningBar(
             Spacer(modifier = Modifier.size(8.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "正在听…",
+                    text = when (phase) {
+                        VoicePhase.LISTENING -> "正在听…松开结束"
+                        VoicePhase.RECORDING -> "正在录音…松开结束"
+                        VoicePhase.TRANSCRIBING -> "正在识别…"
+                        VoicePhase.IDLE -> ""
+                    },
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onPrimaryContainer,
                 )
-                if (partial.isNotBlank()) {
+                val detail = when {
+                    partial.isNotBlank() -> partial
+                    phase == VoicePhase.LISTENING -> "靠近麦克风说话，松开手指完成"
+                    phase == VoicePhase.RECORDING -> "录音会上传到当前 API 配置的语音转写模型"
+                    phase == VoicePhase.TRANSCRIBING -> "请稍候"
+                    else -> ""
+                }
+                if (detail.isNotBlank()) {
                     Text(
-                        text = partial,
+                        text = detail,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onPrimaryContainer,
                         maxLines = 2,
@@ -620,7 +620,6 @@ private fun ListeningBar(
                     )
                 }
             }
-            TextButton(onClick = onStop) { Text("结束") }
         }
     }
 }

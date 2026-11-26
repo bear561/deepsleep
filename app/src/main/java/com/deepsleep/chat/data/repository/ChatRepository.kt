@@ -6,6 +6,7 @@ import com.deepsleep.chat.data.remote.openai.StreamEvent
 import com.deepsleep.chat.domain.model.ModelConfig
 import com.deepsleep.chat.domain.model.PromptMessage
 import com.deepsleep.chat.domain.model.Provider
+import java.io.File
 import kotlinx.coroutines.flow.Flow
 
 class ChatRepository(
@@ -23,4 +24,11 @@ class ChatRepository(
 
     suspend fun listModels(provider: Provider, apiKey: String?): List<ModelConfig> =
         client.listModels(provider, apiKey)
+
+    suspend fun transcribe(
+        provider: Provider,
+        apiKey: String?,
+        modelId: String,
+        file: File,
+    ): String = client.transcribe(provider, apiKey, modelId, file)
 }

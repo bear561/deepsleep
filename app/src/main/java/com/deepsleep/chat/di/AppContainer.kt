@@ -15,6 +15,8 @@ import com.deepsleep.chat.data.repository.ChatRepository
 import com.deepsleep.chat.data.repository.ConversationRepository
 import com.deepsleep.chat.data.repository.ProviderRepository
 import com.deepsleep.chat.data.repository.SettingsRepository
+import com.deepsleep.chat.data.update.UpdateManager
+import com.deepsleep.chat.data.update.UpdateRepository
 
 /**
  * Manual dependency container. Kept intentionally small: no Hilt, no reflection,
@@ -71,12 +73,21 @@ class AppContainer(
         AttachmentRepository(appContext)
     }
 
+    val updateRepository: UpdateRepository by lazy {
+        UpdateRepository(appContext, httpClients)
+    }
+
+    val updateManager: UpdateManager by lazy {
+        UpdateManager(appContext, updateRepository, settingsRepository)
+    }
+
     val backupRepository: BackupRepository by lazy {
         BackupRepository(
             context = appContext,
             conversationRepository = conversationRepository,
             providerRepository = providerRepository,
             settingsRepository = settingsRepository,
+            attachmentRepository = attachmentRepository,
         )
     }
 }

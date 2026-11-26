@@ -19,4 +19,8 @@ class SettingsRepository(
     suspend fun setSearchApiKey(key: String) = store.setSearchApiKey(key)
     suspend fun searchApiKey(): String? = store.searchApiKey()
     suspend fun setOnboardingCompleted() = store.setOnboardingCompleted()
+    suspend fun setUpdateRepo(repo: String) = store.setUpdateRepo(repo)
+    suspend fun setUpdateManifestUrl(url: String) = store.setUpdateManifestUrl(url)
+    suspend fun setAutoCheckUpdates(enabled: Boolean) = store.setAutoCheckUpdates(enabled)
+    suspend fun setLastUpdateCheckAt(timestamp: Long) = store.setLastUpdateCheckAt(timestamp)
 }

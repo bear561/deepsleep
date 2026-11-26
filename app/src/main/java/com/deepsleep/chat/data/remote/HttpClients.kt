@@ -24,4 +24,18 @@ class HttpClients {
         .readTimeout(20, TimeUnit.SECONDS)
         .callTimeout(20, TimeUnit.SECONDS)
         .build()
+
+    /**
+     * GitHub release assets redirect to a CDN, so this client (unlike the
+     * streaming one) must follow redirects. It never sends Authorization, so
+     * following a redirect cannot leak credentials.
+     */
+    val downloads: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .callTimeout(0, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .retryOnConnectionFailure(true)
+        .build()
 }

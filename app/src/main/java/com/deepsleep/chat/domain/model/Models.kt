@@ -26,7 +26,15 @@ data class AppSettings(
     val search: SearchConfig = SearchConfig(),
     val searchHasKey: Boolean = false,
     val onboardingCompleted: Boolean = false,
-)
+    val updateRepo: String = DEFAULT_UPDATE_REPO,
+    val updateManifestUrl: String = "",
+    val autoCheckUpdates: Boolean = true,
+    val lastUpdateCheckAt: Long = 0L,
+) {
+    companion object {
+        const val DEFAULT_UPDATE_REPO = "bear561/deepsleep"
+    }
+}
 
 @Serializable
 data class ModelConfig(
@@ -43,6 +51,7 @@ data class StoredProvider(
     val models: List<ModelConfig> = emptyList(),
     val chatModelId: String = "",
     val reasoningModelId: String? = null,
+    val transcriptionModelId: String? = null,
     val systemPrompt: String = "",
     val temperature: Double? = null,
     val maxTokens: Int? = null,
@@ -57,6 +66,7 @@ data class Provider(
     val models: List<ModelConfig> = emptyList(),
     val chatModelId: String = "",
     val reasoningModelId: String? = null,
+    val transcriptionModelId: String? = null,
     val systemPrompt: String = "",
     val temperature: Double? = null,
     val maxTokens: Int? = null,
@@ -95,6 +105,8 @@ data class Attachment(
     val sizeBytes: Long = 0,
     val text: String = "",
     val isImage: Boolean = false,
+    /** File name inside the app-private chat-images directory. Null for imported/legacy images. */
+    val localFile: String? = null,
 ) {
     val truncated: Boolean get() = text.length >= TextLimits.MAX_CHARS_PER_ATTACHMENT
 }
@@ -103,6 +115,10 @@ object TextLimits {
     const val MAX_CHARS_PER_ATTACHMENT = 20_000
     const val MAX_CHARS_TOTAL_ATTACHMENTS = 40_000
     const val MAX_ATTACHMENT_BYTES = 2_000_000L
+
+    const val MAX_IMAGE_BYTES = 6_000_000L
+    const val MAX_IMAGES_PER_MESSAGE = 6
+    const val MAX_IMAGES_PER_REQUEST = 8
 }
 
 @Serializable
@@ -141,6 +157,14 @@ data class ChatMessage(
 data class PromptMessage(
     val role: String,
     val content: String,
+    val images: List<PromptImage> = emptyList(),
+)
+
+/** A local image that should be sent as an OpenAI-style image_url part. */
+data class PromptImage(
+    val path: String,
+    val mime: String = "image/jpeg",
+    val name: String = "",
 )
 
 object ProviderPresets {
@@ -149,6 +173,7 @@ object ProviderPresets {
         val baseUrl: String,
         val models: List<ModelConfig>,
         val needsApiKey: Boolean = true,
+        val transcriptionModelId: String = "",
     )
 
     val all: List<Preset> = listOf(
@@ -169,6 +194,7 @@ object ProviderPresets {
             label = "硅基流动",
             baseUrl = "https://api.siliconflow.cn/v1",
             models = emptyList(),
+            transcriptionModelId = "FunAudioLLM/SenseVoiceSmall",
         ),
         Preset(
             label = "Ollama（局域网）",

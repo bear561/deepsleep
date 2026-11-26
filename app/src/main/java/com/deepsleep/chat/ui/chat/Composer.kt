@@ -1,7 +1,10 @@
 package com.deepsleep.chat.ui.chat
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -14,6 +17,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
@@ -24,13 +29,25 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.deepsleep.chat.R
+import com.deepsleep.chat.ui.chat.voice.VoicePhase
 
 @Composable
 fun Composer(
@@ -40,13 +57,15 @@ fun Composer(
     onStop: () -> Unit,
     onToggleThinking: () -> Unit,
     onToggleWebSearch: () -> Unit,
-    onAttach: () -> Unit,
+    onPickImages: () -> Unit,
+    onPickFile: () -> Unit,
     onRemoveAttachment: (String) -> Unit,
-    onVoice: () -> Unit,
-    listening: Boolean = false,
+    onVoicePress: () -> Unit,
+    onVoiceRelease: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val canSend = (state.input.isNotBlank() || state.attachments.isNotEmpty()) && !state.isStreaming
+    val voiceActive = state.voicePhase != VoicePhase.IDLE
     Surface(
         modifier = modifier.fillMaxWidth(),
         color = MaterialTheme.colorScheme.surface,
@@ -65,26 +84,33 @@ fun Composer(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     state.attachments.forEach { attachment ->
-                        Surface(
-                            shape = RoundedCornerShape(50),
-                            color = MaterialTheme.colorScheme.surfaceVariant,
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(start = 10.dp, end = 2.dp, top = 2.dp, bottom = 2.dp),
-                                verticalAlignment = Alignment.CenterVertically,
+                        if (attachment.isImage) {
+                            ImageAttachmentChip(
+                                attachment = attachment,
+                                onRemove = { onRemoveAttachment(attachment.id) },
+                            )
+                        } else {
+                            Surface(
+                                shape = RoundedCornerShape(50),
+                                color = MaterialTheme.colorScheme.surfaceVariant,
                             ) {
-                                Text(
-                                    text = attachment.name,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.width(120.dp),
-                                )
-                                IconButton(
-                                    onClick = { onRemoveAttachment(attachment.id) },
-                                    modifier = Modifier.size(26.dp),
+                                Row(
+                                    modifier = Modifier.padding(start = 10.dp, end = 2.dp, top = 2.dp, bottom = 2.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
                                 ) {
-                                    Text("×", style = MaterialTheme.typography.labelMedium)
+                                    Text(
+                                        text = attachment.name,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.width(120.dp),
+                                    )
+                                    IconButton(
+                                        onClick = { onRemoveAttachment(attachment.id) },
+                                        modifier = Modifier.size(26.dp),
+                                    ) {
+                                        Text("×", style = MaterialTheme.typography.labelMedium)
+                                    }
                                 }
                             }
                         }
@@ -92,7 +118,7 @@ fun Composer(
                     if (state.attachmentLoading) {
                         CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 1.5.dp)
                         Text(
-                            text = "读取附件…",
+                            text = "处理中…",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -104,15 +130,34 @@ fun Composer(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.Bottom,
             ) {
-                IconButton(
-                    onClick = onAttach,
-                    enabled = !state.isStreaming && !state.attachmentLoading,
-                ) {
-                    Icon(
-                        painter = painterResource(R.drawable.ic_attach),
-                        contentDescription = "添加附件",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                var attachMenu by remember { mutableStateOf(false) }
+                Box {
+                    IconButton(
+                        onClick = { attachMenu = true },
+                        enabled = !state.isStreaming && !state.attachmentLoading,
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_attach),
+                            contentDescription = "添加附件",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    DropdownMenu(expanded = attachMenu, onDismissRequest = { attachMenu = false }) {
+                        DropdownMenuItem(
+                            text = { Text("从相册选择图片") },
+                            onClick = {
+                                attachMenu = false
+                                onPickImages()
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("选择文本文件") },
+                            onClick = {
+                                attachMenu = false
+                                onPickFile()
+                            },
+                        )
+                    }
                 }
                 OutlinedTextField(
                     value = state.input,
@@ -124,11 +169,35 @@ fun Composer(
                     minLines = 1,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
                 )
-                IconButton(onClick = onVoice) {
+                // Press-and-hold: voice recording starts on touch down and stops
+                // on release, matching the official app's interaction.
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (voiceActive) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+                            CircleShape,
+                        )
+                        .pointerInput(Unit) {
+                            detectTapGestures(
+                                onPress = {
+                                    onVoicePress()
+                                    tryAwaitRelease()
+                                    onVoiceRelease()
+                                },
+                            )
+                        }
+                        .semantics {
+                            contentDescription = "按住说话"
+                            role = Role.Button
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
                     Icon(
                         painter = painterResource(R.drawable.ic_mic),
-                        contentDescription = if (listening) "停止语音输入" else "语音输入",
-                        tint = if (listening) {
+                        contentDescription = null,
+                        tint = if (voiceActive) {
                             MaterialTheme.colorScheme.primary
                         } else {
                             MaterialTheme.colorScheme.onSurfaceVariant
@@ -192,5 +261,45 @@ fun Composer(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun ImageAttachmentChip(
+    attachment: com.deepsleep.chat.domain.model.Attachment,
+    onRemove: () -> Unit,
+) {
+    Box(modifier = Modifier.size(56.dp)) {
+        LocalAttachmentImage(
+            attachment = attachment,
+            modifier = Modifier
+                .size(56.dp)
+                .clip(RoundedCornerShape(10.dp)),
+        )
+        Surface(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .size(18.dp),
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.scrim.copy(alpha = 0.65f),
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Text(
+                    text = "×",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White,
+                )
+            }
+        }
+        // The remove target covers the badge and a little extra for fingers.
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .size(28.dp)
+                .clip(CircleShape)
+                .pointerInput(Unit) {
+                    detectTapGestures(onTap = { onRemove() })
+                },
+        )
     }
 }

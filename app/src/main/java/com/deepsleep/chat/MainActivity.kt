@@ -5,12 +5,14 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Box
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.deepsleep.chat.domain.model.AppSettings
 import com.deepsleep.chat.domain.model.ThemeMode
 import com.deepsleep.chat.ui.navigation.DeepSleepApp
 import com.deepsleep.chat.ui.theme.DeepSleepTheme
+import com.deepsleep.chat.ui.update.UpdateHost
 
 class MainActivity : ComponentActivity() {
 
@@ -27,7 +29,10 @@ class MainActivity : ComponentActivity() {
                 ThemeMode.DARK -> true
             }
             DeepSleepTheme(darkTheme = darkTheme) {
-                DeepSleepApp(container)
+                Box {
+                    DeepSleepApp(container)
+                    UpdateHost(container)
+                }
             }
         }
     }

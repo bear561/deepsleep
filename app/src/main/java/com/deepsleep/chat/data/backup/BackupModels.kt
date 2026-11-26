@@ -54,6 +54,9 @@ data class OwnSettings(
     val contextTokenLimit: Int = 32_000,
     val autoTitle: Boolean = false,
     val search: SearchConfig = SearchConfig(),
+    val updateRepo: String = "bear561/deepsleep",
+    val updateManifestUrl: String = "",
+    val autoCheckUpdates: Boolean = true,
 )
 
 @Serializable

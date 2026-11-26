@@ -5,9 +5,12 @@ import com.deepsleep.chat.domain.model.ChatMessage
 import com.deepsleep.chat.domain.model.Conversation
 import com.deepsleep.chat.domain.model.MessageRole
 import com.deepsleep.chat.domain.model.MessageStatus
+import com.deepsleep.chat.domain.model.PromptImage
 import com.deepsleep.chat.domain.model.PromptMessage
 import com.deepsleep.chat.domain.model.Provider
 import com.deepsleep.chat.domain.model.SearchSource
+import com.deepsleep.chat.domain.model.TextLimits
+import java.io.File
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.time.format.TextStyle
@@ -27,9 +30,10 @@ object PromptBuilder {
         history: List<ChatMessage>,
         sources: List<SearchSource>,
         contextLimit: Int,
+        imageDir: File? = null,
     ): BuiltPrompt {
         val systemText = buildSystemPrompt(provider, conversation, sources)
-        val candidates = history.mapNotNull { it.toPromptText() }
+        val candidates = history.mapNotNull { it.toPromptText(imageDir) }
         val budget = contextLimit.coerceAtLeast(2_000)
         val systemCost = TokenEstimator.estimate(systemText)
         var used = systemCost
@@ -39,7 +43,7 @@ object PromptBuilder {
         // Walk backwards so the newest turns survive. Always keep the latest user turn.
         for (index in candidates.indices.reversed()) {
             val message = candidates[index]
-            val cost = TokenEstimator.estimate(message.content)
+            val cost = message.estimatedCost()
             val isLatest = index == candidates.lastIndex
             if (isLatest || used + cost <= budget) {
                 kept.add(0, message)
@@ -47,6 +51,23 @@ object PromptBuilder {
             } else {
                 trimmed = true
                 break
+            }
+        }
+
+        // Never resend more than a handful of images: they are expensive per
+        // turn. Newest images win; older ones become a short text placeholder.
+        var imageBudget = TextLimits.MAX_IMAGES_PER_REQUEST
+        for (index in kept.indices.reversed()) {
+            val message = kept[index]
+            if (message.images.isEmpty()) continue
+            val keep = message.images.take(imageBudget)
+            val dropped = message.images.drop(keep.size)
+            imageBudget -= keep.size
+            if (dropped.isNotEmpty()) {
+                val placeholder = dropped.joinToString("") { image ->
+                    "\n\n[图片：${image.name.ifBlank { "图片" }}（较早，未重复发送）]"
+                }
+                kept[index] = message.copy(content = message.content + placeholder, images = keep)
             }
         }
 
@@ -60,18 +81,44 @@ object PromptBuilder {
         )
     }
 
-    private fun ChatMessage.toPromptText(): PromptMessage? {
+    private fun PromptMessage.estimatedCost(): Int =
+        TokenEstimator.estimate(content) + images.size * IMAGE_TOKEN_ESTIMATE
+
+    private fun ChatMessage.toPromptText(imageDir: File?): PromptMessage? {
         if (role != MessageRole.USER && role != MessageRole.ASSISTANT) return null
         if (role == MessageRole.ASSISTANT && (content.isBlank() || status == MessageStatus.ERROR)) return null
         if (role == MessageRole.USER && content.isBlank() && attachments.isEmpty()) return null
-        val enriched = if (role == MessageRole.USER && attachments.isNotEmpty()) {
-            content + attachments.joinToString("") { it.toBlock() }
-        } else {
-            content
+
+        var enriched = content
+        val images = ArrayList<PromptImage>()
+        if (role == MessageRole.USER && attachments.isNotEmpty()) {
+            attachments.forEach { attachment ->
+                if (attachment.isImage) {
+                    val localName = attachment.localFile
+                    val file = if (imageDir != null && localName != null) {
+                        File(imageDir, localName)
+                            .takeIf { it.isFile && it.length() <= TextLimits.MAX_IMAGE_BYTES }
+                    } else {
+                        null
+                    }
+                    if (file != null) {
+                        images += PromptImage(
+                            path = file.absolutePath,
+                            mime = attachment.mime.ifBlank { "image/jpeg" },
+                            name = attachment.name,
+                        )
+                    } else {
+                        enriched += "\n\n[图片：${attachment.name}]"
+                    }
+                } else {
+                    enriched += attachment.toBlock()
+                }
+            }
         }
         return PromptMessage(
             role = if (role == MessageRole.USER) "user" else "assistant",
             content = enriched,
+            images = images,
         )
     }
 
@@ -130,4 +177,7 @@ object PromptBuilder {
             if (searchBlock.isNotBlank()) add(searchBlock)
         }.joinToString("\n\n")
     }
+
+    /** Vision models typically bill a fixed-ish amount per image; keep trimming conservative. */
+    private const val IMAGE_TOKEN_ESTIMATE = 800
 }

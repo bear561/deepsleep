@@ -3,26 +3,36 @@ package com.deepsleep.chat.ui.chat.voice
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 
 /**
- * Thin wrapper around the system SpeechRecognizer. Using the recognizer
- * service directly (instead of only launching the vendor's ASR activity)
- * works better on MIUI/HyperOS where the speech activity and the service have
- * different availability and permission behavior.
+ * Thin wrapper around the system SpeechRecognizer, driven as press-and-hold:
+ * call [start] when the mic is pressed and [finish] when it is released.
+ *
+ * The vendor recognition service is not present on every Chinese ROM (vivo,
+ * some Honor/OPPO builds do not expose one), so callers must also provide a
+ * recording + cloud-transcription fallback. [isAvailable] tells them which
+ * path to use.
  */
 class SpeechInputController(
     private val context: Context,
     private val onPartial: (String) -> Unit,
     private val onFinal: (String) -> Unit,
-    private val onError: (String) -> Unit,
-    private val onListeningChanged: (Boolean) -> Unit,
+    /** (user message, true when the system recognizer itself is unusable) */
+    private val onError: (String, Boolean) -> Unit,
 ) {
     private val recognizer: SpeechRecognizer? = runCatching {
         SpeechRecognizer.createSpeechRecognizer(context)
     }.getOrNull()
+
+    private val handler = Handler(Looper.getMainLooper())
+    private var lastPartial = ""
+    private var finished = true
+    private var listening = false
 
     fun isAvailable(): Boolean =
         recognizer != null && SpeechRecognizer.isRecognitionAvailable(context)
@@ -30,10 +40,14 @@ class SpeechInputController(
     fun start() {
         val engine = recognizer
         if (engine == null || !SpeechRecognizer.isRecognitionAvailable(context)) {
-            onListeningChanged(false)
-            onError("系统没有可用的语音识别服务，可使用输入法的语音键")
+            onError(NO_SERVICE_MESSAGE, true)
             return
         }
+        if (listening) return
+        handler.removeCallbacks(timeoutRunnable)
+        lastPartial = ""
+        finished = false
+        listening = true
         engine.setRecognitionListener(listener)
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -42,26 +56,56 @@ class SpeechInputController(
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
         }
-        onListeningChanged(true)
         runCatching { engine.startListening(intent) }.onFailure { throwable ->
-            onListeningChanged(false)
-            onError("无法启动语音识别：${throwable.message ?: "未知错误"}")
+            listening = false
+            finished = true
+            onError("无法启动语音识别：${throwable.message ?: "未知错误"}", true)
         }
     }
 
-    fun stop() {
-        runCatching { recognizer?.stopListening() }
-        onListeningChanged(false)
+    /** The finger was lifted: stop recording but keep waiting for the final result. */
+    fun finish() {
+        val engine = recognizer
+        if (engine == null || finished) return
+        // Some vendor engines never call onResults after stopListening(); do not
+        // leave the UI stuck forever if that happens.
+        handler.postDelayed(timeoutRunnable, RESULT_TIMEOUT_MS)
+        runCatching { engine.stopListening() }
     }
 
     fun cancel() {
+        if (finished) return
+        finished = true
+        listening = false
+        lastPartial = ""
+        handler.removeCallbacks(timeoutRunnable)
         runCatching { recognizer?.cancel() }
-        onListeningChanged(false)
     }
 
     fun destroy() {
+        finished = true
+        listening = false
+        handler.removeCallbacks(timeoutRunnable)
         runCatching { recognizer?.cancel() }
         runCatching { recognizer?.destroy() }
+    }
+
+    private val timeoutRunnable = Runnable {
+        if (!finished) conclude(lastPartial, "没有听清，请再说一次", serviceUnavailable = true)
+    }
+
+    private fun conclude(text: String, fallbackError: String? = null, serviceUnavailable: Boolean = false) {
+        if (finished) return
+        finished = true
+        listening = false
+        handler.removeCallbacks(timeoutRunnable)
+        lastPartial = ""
+        val trimmed = text.trim()
+        if (trimmed.isNotEmpty()) {
+            onFinal(trimmed)
+        } else {
+            onError(fallbackError ?: "没有听清，请再说一次", serviceUnavailable)
+        }
     }
 
     private val listener = object : RecognitionListener {
@@ -77,27 +121,34 @@ class SpeechInputController(
                 ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 ?.firstOrNull()
                 .orEmpty()
-            if (text.isNotBlank()) onPartial(text)
+            if (text.isNotBlank()) {
+                lastPartial = text
+                onPartial(text)
+            }
         }
 
         override fun onResults(results: Bundle?) {
-            onListeningChanged(false)
             val text = results
                 ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 ?.firstOrNull()
                 .orEmpty()
-            if (text.isNotBlank()) {
-                onFinal(text)
-            } else {
-                onError("没有听清，请再说一次")
-            }
+            conclude(text.ifBlank { lastPartial })
         }
 
         override fun onError(error: Int) {
-            onListeningChanged(false)
-            onError(errorMessage(error))
+            // Keep whatever the user already saw via partial results: several
+            // OEM engines report NO_MATCH after having produced usable text.
+            if (lastPartial.isNotBlank()) {
+                conclude(lastPartial)
+            } else {
+                conclude("", errorMessage(error), serviceUnavailable(error))
+            }
         }
     }
+
+    /** Errors that mean "this phone's recognizer is not usable", not "user was unclear". */
+    private fun serviceUnavailable(code: Int): Boolean =
+        code == 1 || code == 2 || code == 5 || code == 9 || code == 11 || code == 12 || code == 13
 
     private fun errorMessage(code: Int): String = when (code) {
         1 -> "语音服务网络超时"
@@ -108,11 +159,16 @@ class SpeechInputController(
         6 -> "没有检测到语音，请靠近麦克风再说一次"
         7 -> "没有听清，请再说一次"
         8 -> "语音识别正忙，请稍后再试"
-        9 -> "系统语音服务缺少麦克风权限。请到 设置→应用 里找到“小米语音引擎/系统语音服务”，允许其使用麦克风后再试"
+        9 -> "系统语音服务缺少麦克风权限。请到 设置→应用 里找到系统的语音引擎，允许其使用麦克风后再试"
         10 -> "语音服务返回错误"
         11 -> "无法连接系统语音服务"
         12 -> "系统语音服务不支持中文"
         13 -> "中文语音包不可用，请在系统设置中下载"
         else -> "语音识别失败（错误码 $code）"
+    }
+
+    companion object {
+        const val NO_SERVICE_MESSAGE = "系统没有内置语音识别服务"
+        private const val RESULT_TIMEOUT_MS = 8_000L
     }
 }

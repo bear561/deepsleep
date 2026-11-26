@@ -1,6 +1,7 @@
 package com.deepsleep.chat.ui.chat
 
 import android.net.Uri
+import android.os.SystemClock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -20,7 +21,11 @@ import com.deepsleep.chat.domain.model.Provider
 import com.deepsleep.chat.domain.model.SearchProviderType
 import com.deepsleep.chat.domain.model.SearchSource
 import com.deepsleep.chat.domain.model.TextLimits
+import com.deepsleep.chat.ui.chat.voice.SpeechInputController
+import com.deepsleep.chat.ui.chat.voice.VoicePhase
+import com.deepsleep.chat.ui.chat.voice.VoiceRecorder
 import com.deepsleep.chat.util.PromptBuilder
+import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -58,6 +63,8 @@ data class ChatUiState(
     val warning: String? = null,
     val searchConfigured: Boolean = false,
     val reasoningPickerVisible: Boolean = false,
+    val voicePhase: VoicePhase = VoicePhase.IDLE,
+    val voicePartial: String = "",
 ) {
     val activeProvider: Provider?
         get() = providers.firstOrNull { it.id == providerId }
@@ -93,6 +100,44 @@ class ChatViewModel(
 
     private val conversationQuery = MutableStateFlow("")
     private var sendJob: Job? = null
+    private var transcribeJob: Job? = null
+    private var recordingFile: File? = null
+    private var voiceStartedAt = 0L
+
+    /**
+     * Some ROMs report a system recognizer but every attempt fails (or the
+     * service is missing its own mic permission). Once that happens, prefer
+     * recording + cloud transcription for the rest of the session.
+     */
+    private var preferRecording = false
+
+    private var speechController: SpeechInputController? = null
+
+    /**
+     * Created on first use: every view-model on the back stack would otherwise
+     * bind a SpeechRecognizer service even if voice is never touched.
+     */
+    private fun speech(): SpeechInputController = speechController ?: SpeechInputController(
+        context = container.context,
+        onPartial = { text ->
+            _state.update { it.copy(voicePartial = text) }
+        },
+        onFinal = { text ->
+            _state.update { it.copy(voicePhase = VoicePhase.IDLE, voicePartial = "") }
+            appendVoiceText(text)
+        },
+        onError = { message, serviceUnavailable ->
+            _state.update { it.copy(voicePhase = VoicePhase.IDLE, voicePartial = "") }
+            if (serviceUnavailable && canTranscribe()) {
+                preferRecording = true
+                showWarning("$message。下次按住麦克风将改用录音转写。")
+            } else {
+                showError(message)
+            }
+        },
+    ).also { speechController = it }
+
+    private val voiceRecorder = VoiceRecorder(container.context)
 
     init {
         observeConfiguration()
@@ -127,6 +172,9 @@ class ChatViewModel(
 
     fun newChat() {
         if (sendJob?.isActive == true) stopGeneration()
+        cancelVoiceInput()
+        val pending = _state.value.attachments
+        attachmentRepository.deleteImages(pending)
         _state.update { current ->
             current.copy(
                 conversationId = null,
@@ -139,6 +187,8 @@ class ChatViewModel(
                 isStreaming = false,
                 searching = false,
                 isLoadingConversation = false,
+                voicePhase = VoicePhase.IDLE,
+                voicePartial = "",
             )
         }
     }
@@ -159,6 +209,11 @@ class ChatViewModel(
             return
         }
         val attachments = current.attachments
+        val displayText = text.ifBlank {
+            attachments.firstOrNull()?.let { attachment ->
+                if (attachment.isImage) "[图片] ${attachment.name}" else "[附件] ${attachment.name}"
+            }.orEmpty()
+        }
         _state.update {
             it.copy(input = "", attachments = emptyList(), error = null, warning = null)
         }
@@ -172,7 +227,7 @@ class ChatViewModel(
                     thinkingEnabled = _state.value.thinkingEnabled,
                     webSearchEnabled = _state.value.webSearchEnabled,
                 )
-                val title = deriveTitle(text)
+                val title = deriveTitle(displayText)
                 conversationRepository.renameConversation(conversation.id, title)
                 conversation = conversation.copy(title = title)
                 _state.update { it.copy(conversationId = conversation.id, conversation = conversation) }
@@ -197,13 +252,13 @@ class ChatViewModel(
                 status = MessageStatus.COMPLETE,
                 attachments = attachments,
             )
-            conversationRepository.touchConversation(conversation.id, text)
+            conversationRepository.touchConversation(conversation.id, displayText)
             _state.update {
                 it.copy(
                     messages = it.messages + userMessage,
                     conversation = it.conversation?.copy(
                         updatedAt = System.currentTimeMillis(),
-                        lastPreview = text.take(120),
+                        lastPreview = displayText.take(120),
                     ),
                 )
             }
@@ -259,7 +314,10 @@ class ChatViewModel(
                 .firstOrNull { it.id == messageId && it.role == MessageRole.USER }
                 ?: return@startJob
             conversationRepository.updateMessage(message.copy(content = newText.trim()))
+            val removed = conversationRepository.getMessages(conversation.id)
+                .filter { it.seq > message.seq }
             conversationRepository.deleteMessagesAfter(conversation.id, message.seq)
+            attachmentRepository.deleteImages(removed.flatMap { it.attachments })
             val messages = conversationRepository.getMessages(conversation.id)
             _state.update { it.copy(messages = messages, error = null) }
             generateReply(
@@ -370,6 +428,124 @@ class ChatViewModel(
         }
     }
 
+    fun hasSystemSpeechService(): Boolean = speech().isAvailable()
+
+    /** Called when the mic is pressed. Recording stops in [stopVoiceInput]. */
+    fun startVoiceInput() {
+        val current = _state.value
+        if (current.isStreaming || current.voicePhase != VoicePhase.IDLE) return
+        if (current.noProvider) {
+            showError("请先添加 API 配置")
+            return
+        }
+        voiceStartedAt = SystemClock.elapsedRealtime()
+        if (!preferRecording && speech().isAvailable()) {
+            _state.update { it.copy(voicePhase = VoicePhase.LISTENING, voicePartial = "", error = null) }
+            speech().start()
+            return
+        }
+
+        val provider = current.activeProvider
+        if (provider == null) {
+            showError("请先添加 API 配置")
+            return
+        }
+        if (provider.transcriptionModelId.isNullOrBlank()) {
+            showError(VOICE_SETUP_HINT)
+            return
+        }
+        val file = voiceRecorder.start()
+        if (file == null) {
+            showError("无法启动录音，请检查麦克风是否被其他应用占用")
+            return
+        }
+        recordingFile = file
+        _state.update { it.copy(voicePhase = VoicePhase.RECORDING, voicePartial = "", error = null) }
+    }
+
+    /** Called when the finger is lifted. */
+    fun stopVoiceInput() {
+        val heldMs = SystemClock.elapsedRealtime() - voiceStartedAt
+        when (_state.value.voicePhase) {
+            VoicePhase.LISTENING -> {
+                if (heldMs < MIN_HOLD_MS) {
+                    speechController?.cancel()
+                    resetVoiceState()
+                    showWarning("按住麦克风说话，松开结束")
+                } else {
+                    _state.update { it.copy(voicePhase = VoicePhase.TRANSCRIBING) }
+                    speechController?.finish()
+                }
+            }
+            VoicePhase.RECORDING -> {
+                val file = voiceRecorder.stop()
+                recordingFile = null
+                _state.update { it.copy(voicePhase = VoicePhase.TRANSCRIBING, voicePartial = "") }
+                when {
+                    file == null -> {
+                        resetVoiceState()
+                        showError("没有录到声音，请按住麦克风再说一次")
+                    }
+                    heldMs < MIN_HOLD_MS || file.length() < MIN_RECORDING_BYTES -> {
+                        file.delete()
+                        resetVoiceState()
+                        showWarning("按住麦克风说话，松开结束")
+                    }
+                    else -> transcribeVoice(file)
+                }
+            }
+            else -> Unit
+        }
+    }
+
+    fun cancelVoiceInput() {
+        speechController?.cancel()
+        voiceRecorder.cancel()
+        recordingFile?.delete()
+        recordingFile = null
+        transcribeJob?.cancel()
+        transcribeJob = null
+        resetVoiceState()
+    }
+
+    private fun resetVoiceState() {
+        _state.update { it.copy(voicePhase = VoicePhase.IDLE, voicePartial = "") }
+    }
+
+    private fun transcribeVoice(file: File) {
+        val provider = _state.value.activeProvider
+        val modelId = provider?.transcriptionModelId?.trim().orEmpty()
+        if (provider == null || modelId.isEmpty()) {
+            file.delete()
+            resetVoiceState()
+            showError(VOICE_SETUP_HINT)
+            return
+        }
+        transcribeJob?.cancel()
+        transcribeJob = viewModelScope.launch {
+            try {
+                val key = providerRepository.apiKey(provider.id)
+                val text = chatRepository.transcribe(provider, key, modelId, file)
+                appendVoiceText(text)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                val message = (t as? ChatFailure)?.userMessage
+                    ?: t.message
+                    ?: "语音转写失败，请稍后重试"
+                showError(message)
+            } finally {
+                withContext(NonCancellable) {
+                    file.delete()
+                    resetVoiceState()
+                }
+            }
+        }
+    }
+
+    private fun canTranscribe(): Boolean =
+        _state.value.activeProvider?.transcriptionModelId?.isNotBlank() == true
+
     fun toggleWebSearch() {
         val current = _state.value
         val enabled = !current.webSearchEnabled
@@ -385,7 +561,7 @@ class ChatViewModel(
     }
 
     fun addAttachment(uri: Uri) {
-        if (_state.value.attachmentLoading) return
+        if (_state.value.attachmentLoading || _state.value.isStreaming) return
         _state.update { it.copy(attachmentLoading = true, error = null) }
         viewModelScope.launch {
             try {
@@ -404,8 +580,56 @@ class ChatViewModel(
         }
     }
 
+    fun addImageAttachments(uris: List<Uri>) {
+        if (uris.isEmpty() || _state.value.attachmentLoading || _state.value.isStreaming) return
+        val existingImages = _state.value.attachments.count { it.isImage }
+        val room = TextLimits.MAX_IMAGES_PER_MESSAGE - existingImages
+        if (room <= 0) {
+            showError("每条消息最多添加 ${TextLimits.MAX_IMAGES_PER_MESSAGE} 张图片")
+            return
+        }
+        val selected = uris.take(room)
+        _state.update { it.copy(attachmentLoading = true, error = null) }
+        viewModelScope.launch {
+            val imported = mutableListOf<Attachment>()
+            var lastError: String? = null
+            try {
+                selected.forEach { uri ->
+                    runCatching { attachmentRepository.importImage(uri) }
+                        .onSuccess { imported += it }
+                        .onFailure { throwable -> lastError = throwable.message ?: "读取图片失败" }
+                }
+            } finally {
+                val failure = lastError
+                _state.update { state ->
+                    val providerUrl = state.activeProvider?.baseUrl.orEmpty()
+                    val unsupportedVision = imported.isNotEmpty() &&
+                        providerUrl.contains("api.deepseek.com", ignoreCase = true)
+                    state.copy(
+                        attachments = state.attachments + imported,
+                        attachmentLoading = false,
+                        error = when {
+                            uris.size > room ->
+                                "每条消息最多 ${TextLimits.MAX_IMAGES_PER_MESSAGE} 张图片，已添加前 $room 张"
+                            failure != null && imported.isEmpty() -> failure
+                            failure != null -> "部分图片未能添加：$failure"
+                            else -> state.error
+                        },
+                        warning = if (unsupportedVision) {
+                            "DeepSeek 官方 API 不支持图片输入，请切换到支持视觉的 OpenAI 兼容模型后再发送。"
+                        } else {
+                            state.warning
+                        },
+                    )
+                }
+            }
+        }
+    }
+
     fun removeAttachment(id: String) {
-        _state.update { it.copy(attachments = it.attachments.filterNot { attachment -> attachment.id == id }) }
+        val attachment = _state.value.attachments.firstOrNull { it.id == id } ?: return
+        if (attachment.isImage) attachmentRepository.deleteImages(listOf(attachment))
+        _state.update { it.copy(attachments = it.attachments.filterNot { existing -> existing.id == id }) }
     }
 
     fun renameConversation(id: String, title: String) {
@@ -421,7 +645,9 @@ class ChatViewModel(
 
     fun deleteConversation(id: String) {
         viewModelScope.launch {
+            val removed = conversationRepository.getMessages(id)
             conversationRepository.deleteConversation(id)
+            attachmentRepository.deleteImages(removed.flatMap { it.attachments })
             if (_state.value.conversationId == id) {
                 _state.update {
                     it.copy(
@@ -444,6 +670,10 @@ class ChatViewModel(
 
     override fun onCleared() {
         sendJob?.cancel()
+        transcribeJob?.cancel()
+        speechController?.destroy()
+        voiceRecorder.cancel()
+        attachmentRepository.deleteImages(_state.value.attachments)
         super.onCleared()
     }
 
@@ -560,7 +790,8 @@ class ChatViewModel(
         lastUserText: String,
     ) {
         var sources: List<SearchSource> = emptyList()
-        if (webSearchEnabled) {
+        // An image-only message has no text to search for.
+        if (webSearchEnabled && lastUserText.isNotBlank()) {
             _state.update { it.copy(searching = true) }
             try {
                 val settings = settingsRepository.settings.first()
@@ -589,6 +820,7 @@ class ChatViewModel(
             history = history,
             sources = sources,
             contextLimit = settings.contextTokenLimit,
+            imageDir = attachmentRepository.imageDir,
         )
         if (built.trimmedHistory) {
             _state.update { it.copy(warning = "历史对话过长，已自动裁剪较早内容") }
@@ -813,6 +1045,12 @@ class ChatViewModel(
     }
 
     companion object {
+        private const val MIN_HOLD_MS = 350L
+        private const val MIN_RECORDING_BYTES = 2_000L
+        private const val VOICE_SETUP_HINT =
+            "系统没有内置语音识别服务（vivo 等机型常见）。请到「设置 → API 配置 → 高级选项」填写「语音转写模型」，" +
+                "例如 whisper-1（OpenAI）或 FunAudioLLM/SenseVoiceSmall（硅基流动），再按住麦克风重试。"
+
         fun factory(container: AppContainer, conversationId: String?): ViewModelProvider.Factory =
             viewModelFactory {
                 initializer { ChatViewModel(container, conversationId) }

@@ -43,6 +43,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.deepsleep.chat.BuildConfig
+import com.deepsleep.chat.data.update.UpdateRepository
 import com.deepsleep.chat.di.AppContainer
 import com.deepsleep.chat.domain.model.AppSettings
 import com.deepsleep.chat.domain.model.SearchProviderType
@@ -66,6 +67,8 @@ fun SettingsScreen(
     val scope = rememberCoroutineScope()
     var showThemeDialog by remember { mutableStateOf(false) }
     var showContextDialog by remember { mutableStateOf(false) }
+    var showRepoDialog by remember { mutableStateOf(false) }
+    var showManifestDialog by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -201,6 +204,41 @@ fun SettingsScreen(
             }
 
             item { Spacer(modifier = Modifier.size(8.dp)) }
+            item { SectionTitle("更新") }
+            item {
+                SettingRow(
+                    title = "检查更新",
+                    value = "当前 ${BuildConfig.VERSION_NAME}",
+                    onClick = { container.updateManager.check(manual = true) },
+                )
+            }
+            item {
+                SettingRow(
+                    title = "自动检查更新",
+                    value = if (settings.autoCheckUpdates) "已开启" else "已关闭",
+                    onClick = {
+                        scope.launch {
+                            container.settingsRepository.setAutoCheckUpdates(!settings.autoCheckUpdates)
+                        }
+                    },
+                )
+            }
+            item {
+                SettingRow(
+                    title = "更新仓库",
+                    value = settings.updateRepo,
+                    onClick = { showRepoDialog = true },
+                )
+            }
+            item {
+                SettingRow(
+                    title = "自定义更新地址",
+                    value = if (settings.updateManifestUrl.isBlank()) "未设置" else "已设置",
+                    onClick = { showManifestDialog = true },
+                )
+            }
+
+            item { Spacer(modifier = Modifier.size(8.dp)) }
             item { SectionTitle("关于") }
             item {
                 Column(modifier = Modifier.padding(vertical = 4.dp)) {
@@ -284,6 +322,103 @@ fun SettingsScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showContextDialog = false }) { Text("取消") }
+            },
+        )
+    }
+
+    if (showRepoDialog) {
+        var repo by remember { mutableStateOf(settings.updateRepo) }
+        var invalid by remember { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { showRepoDialog = false },
+            title = { Text("更新仓库") },
+            text = {
+                OutlinedTextField(
+                    value = repo,
+                    onValueChange = {
+                        repo = it
+                        invalid = false
+                    },
+                    singleLine = true,
+                    label = { Text("owner/repo") },
+                    placeholder = { Text("bear561/deepsleep") },
+                    isError = invalid,
+                    supportingText = {
+                        Text(
+                            if (invalid) {
+                                "格式不正确，应类似 bear561/deepsleep"
+                            } else {
+                                "公开的 GitHub 仓库。发布 Release 并上传新 APK 后，App 内即可检查更新。"
+                            },
+                        )
+                    },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val normalized = UpdateRepository.normalizeRepo(repo)
+                        if (normalized == null) {
+                            invalid = true
+                        } else {
+                            scope.launch { container.settingsRepository.setUpdateRepo(normalized) }
+                            showRepoDialog = false
+                        }
+                    },
+                ) { Text("保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRepoDialog = false }) { Text("取消") }
+            },
+        )
+    }
+
+    if (showManifestDialog) {
+        var url by remember { mutableStateOf(settings.updateManifestUrl) }
+        var invalid by remember { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { showManifestDialog = false },
+            title = { Text("自定义更新地址") },
+            text = {
+                OutlinedTextField(
+                    value = url,
+                    onValueChange = {
+                        url = it
+                        invalid = false
+                    },
+                    singleLine = true,
+                    label = { Text("JSON 地址（可选）") },
+                    placeholder = { Text("https://example.com/deepsleep/update.json") },
+                    isError = invalid,
+                    supportingText = {
+                        Text(
+                            if (invalid) {
+                                "必须以 http:// 或 https:// 开头；留空则使用 GitHub 仓库"
+                            } else {
+                                "设置后优先使用该 JSON 地址，而不是 GitHub Releases。留空可关闭。"
+                            },
+                        )
+                    },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val value = url.trim()
+                        if (value.isNotEmpty() &&
+                            !value.startsWith("http://") &&
+                            !value.startsWith("https://")
+                        ) {
+                            invalid = true
+                        } else {
+                            scope.launch { container.settingsRepository.setUpdateManifestUrl(value) }
+                            showManifestDialog = false
+                        }
+                    },
+                ) { Text("保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showManifestDialog = false }) { Text("取消") }
             },
         )
     }

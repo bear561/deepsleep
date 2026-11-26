@@ -30,6 +30,7 @@ data class ProviderEditState(
     val modelsText: String = "",
     val chatModelId: String = "",
     val reasoningModelId: String = "",
+    val transcriptionModelId: String = "",
     val temperature: String = "",
     val maxTokens: String = "",
     val systemPrompt: String = "",
@@ -81,6 +82,7 @@ class ProviderEditViewModel(
                             modelsText = ModelConfigs.format(provider.models),
                             chatModelId = provider.chatModelId,
                             reasoningModelId = provider.reasoningModelId.orEmpty(),
+                            transcriptionModelId = provider.transcriptionModelId.orEmpty(),
                             temperature = provider.temperature?.toString().orEmpty(),
                             maxTokens = provider.maxTokens?.toString().orEmpty(),
                             systemPrompt = provider.systemPrompt,
@@ -107,6 +109,8 @@ class ProviderEditViewModel(
                 chatModelId = models.firstOrNull { !it.supportsReasoning }?.id
                     ?: models.firstOrNull()?.id.orEmpty(),
                 reasoningModelId = models.firstOrNull { it.supportsReasoning }?.id.orEmpty(),
+                transcriptionModelId = preset.transcriptionModelId
+                    .ifBlank { current.transcriptionModelId },
                 message = null,
             )
         }
@@ -288,6 +292,7 @@ class ProviderEditViewModel(
             models = models,
             chatModelId = chatModel,
             reasoningModelId = reasoningModel,
+            transcriptionModelId = current.transcriptionModelId.trim().ifBlank { null },
             systemPrompt = current.systemPrompt.trim(),
             temperature = temperature,
             maxTokens = maxTokens,

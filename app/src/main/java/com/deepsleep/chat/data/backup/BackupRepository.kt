@@ -51,6 +51,7 @@ class BackupRepository(
     private val conversationRepository: ConversationRepository,
     private val providerRepository: ProviderRepository,
     private val settingsRepository: SettingsRepository,
+    private val attachmentRepository: com.deepsleep.chat.data.repository.AttachmentRepository,
 ) {
     private val json = Json {
         ignoreUnknownKeys = true
@@ -266,11 +267,21 @@ class BackupRepository(
                 contextTokenLimit = settings.contextTokenLimit,
                 autoTitle = settings.autoTitle,
                 search = settings.search,
+                updateRepo = settings.updateRepo,
+                updateManifestUrl = settings.updateManifestUrl,
+                autoCheckUpdates = settings.autoCheckUpdates,
             ),
             providers = providers.map { it.toStored() },
             conversations = conversations.map { it.toOwn() },
             messages = messages.map { it.toOwn() },
         )
+        val imageNames = messages
+            .flatMap { it.attachments }
+            .asSequence()
+            .filter { it.isImage }
+            .mapNotNull { it.localFile }
+            .distinct()
+            .toList()
         val temp = File.createTempFile("deepsleep-own-export-", ".zip", context.cacheDir)
         try {
             ZipOutputStream(BufferedOutputStream(temp.outputStream())).use { zip ->
@@ -278,6 +289,14 @@ class BackupRepository(
                     "deepsleep_backup.json",
                     json.encodeToString(OwnBackupFile.serializer(), backup),
                 )
+                imageNames.forEach { name ->
+                    currentCoroutineContext().ensureActive()
+                    val file = File(attachmentRepository.imageDir, File(name).name)
+                    if (!file.isFile || file.length() > MAX_BACKUP_IMAGE_BYTES) return@forEach
+                    zip.putNextEntry(ZipEntry("images/${file.name}"))
+                    file.inputStream().use { input -> input.copyTo(zip) }
+                    zip.closeEntry()
+                }
             }
             copyTempToUri(temp, uri)
             BackupExportResult(
@@ -303,6 +322,7 @@ class BackupRepository(
         try {
             ZipFile(file).use { zip ->
                 val backup = readOwnBackup(zip)
+                extractOwnBackupImages(zip)
                 val existing = conversationRepository.getAllConversations().map { it.id }.toSet()
                 var conversationsImported = 0
                 var messagesImported = 0
@@ -316,6 +336,12 @@ class BackupRepository(
                     settingsRepository.setContextTokenLimit(ownSettings.contextTokenLimit)
                     settingsRepository.setAutoTitle(ownSettings.autoTitle)
                     settingsRepository.setSearchConfig(ownSettings.search)
+                    runCatching {
+                        com.deepsleep.chat.data.update.UpdateRepository
+                            .normalizeRepo(ownSettings.updateRepo)
+                    }.getOrNull()?.let { settingsRepository.setUpdateRepo(it) }
+                    settingsRepository.setUpdateManifestUrl(ownSettings.updateManifestUrl)
+                    settingsRepository.setAutoCheckUpdates(ownSettings.autoCheckUpdates)
                 }
 
                 backup.providers.forEach { stored ->
@@ -689,6 +715,42 @@ class BackupRepository(
         return backup
     }
 
+    /** Copies image entries from an own backup into the app's private image dir. */
+    private fun extractOwnBackupImages(zip: ZipFile) {
+        var totalBytes = 0L
+        zip.entries().asSequence()
+            .filter { !it.isDirectory && it.name.startsWith("images/") }
+            .take(MAX_BACKUP_IMAGE_COUNT)
+            .forEach { entry ->
+                val name = File(entry.name).name
+                if (name.isBlank()) return@forEach
+                val declared = entry.size
+                if (declared <= 0L || declared > MAX_BACKUP_IMAGE_BYTES) return@forEach
+                if (totalBytes + declared > MAX_BACKUP_IMAGES_TOTAL_BYTES) return@forEach
+                val target = File(attachmentRepository.imageDir, name)
+                if (target.parentFile != attachmentRepository.imageDir) return@forEach
+                if (target.exists()) return@forEach
+                runCatching {
+                    zip.getInputStream(entry).use { input ->
+                        target.outputStream().use { output ->
+                            val buffer = ByteArray(64 * 1024)
+                            var written = 0L
+                            while (true) {
+                                val read = input.read(buffer)
+                                if (read < 0) break
+                                written += read
+                                if (written > MAX_BACKUP_IMAGE_BYTES) {
+                                    throw BackupException("备份中的图片过大，已跳过")
+                                }
+                                output.write(buffer, 0, read)
+                            }
+                        }
+                    }
+                    totalBytes += declared
+                }.onFailure { target.delete() }
+            }
+    }
+
     private fun readManifestVersion(zip: ZipFile): Int {
         val entry = zip.getEntry("manifest.json")
             ?: throw BackupException("不是有效的 DeepSeek 备份（缺少 manifest.json）")
@@ -854,6 +916,7 @@ class BackupRepository(
         models = models,
         chatModelId = chatModelId,
         reasoningModelId = reasoningModelId,
+        transcriptionModelId = transcriptionModelId,
         systemPrompt = systemPrompt,
         temperature = temperature,
         maxTokens = maxTokens,
@@ -868,6 +931,7 @@ class BackupRepository(
         models = models,
         chatModelId = chatModelId,
         reasoningModelId = reasoningModelId,
+        transcriptionModelId = transcriptionModelId,
         systemPrompt = systemPrompt,
         temperature = temperature,
         maxTokens = maxTokens,
@@ -983,5 +1047,8 @@ class BackupRepository(
         const val MAX_SESSION_BYTES = 32L * 1024 * 1024
         const val MAX_OWN_BACKUP_BYTES = 1024L * 1024 * 1024
         const val MAX_SESSION_COUNT = 20_000
+        const val MAX_BACKUP_IMAGE_BYTES = 10L * 1024 * 1024
+        const val MAX_BACKUP_IMAGES_TOTAL_BYTES = 200L * 1024 * 1024
+        const val MAX_BACKUP_IMAGE_COUNT = 200
     }
 }

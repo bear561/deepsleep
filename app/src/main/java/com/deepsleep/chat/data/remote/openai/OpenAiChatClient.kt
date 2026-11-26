@@ -1,10 +1,14 @@
 package com.deepsleep.chat.data.remote.openai
 
+import android.util.Base64
 import com.deepsleep.chat.data.remote.HttpClients
 import com.deepsleep.chat.domain.model.ModelConfig
+import com.deepsleep.chat.domain.model.PromptImage
 import com.deepsleep.chat.domain.model.PromptMessage
 import com.deepsleep.chat.domain.model.Provider
+import com.deepsleep.chat.domain.model.TextLimits
 import com.deepsleep.chat.domain.model.TokenUsage
+import java.io.File
 import java.io.IOException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
@@ -34,7 +38,9 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okio.Buffer
@@ -71,6 +77,9 @@ class OpenAiChatClient(
         val bases = candidateBases(provider.baseUrl)
         var includeUsage = true
         var lastFailure: ChatFailure? = null
+        // Encoding images is comparatively expensive; do it at most once per
+        // file even if the request is retried or the /v1 fallback is tried.
+        val imageCache = HashMap<String, String?>()
 
         outer@ for ((baseIndex, base) in bases.withIndex()) {
             var attempt = 0
@@ -83,6 +92,9 @@ class OpenAiChatClient(
                     modelId = modelId,
                     messages = messages,
                     includeUsage = includeUsage,
+                    imageDataUrl = { image ->
+                        imageCache.getOrPut(image.path) { encodeImageDataUrl(image) }
+                    },
                 )
                 val call = clients.streaming.newCall(request)
                 val cancellation = currentCoroutineContext().job.invokeOnCompletion { call.cancel() }
@@ -202,6 +214,97 @@ class OpenAiChatClient(
         }
     }
 
+    /**
+     * Uploads a recorded clip to an OpenAI-compatible /audio/transcriptions
+     * endpoint. Used as the fallback on devices (e.g. vivo) that do not expose
+     * an Android SpeechRecognizer service.
+     */
+    suspend fun transcribe(
+        provider: Provider,
+        apiKey: String?,
+        modelId: String,
+        file: File,
+    ): String = withContext(Dispatchers.IO) {
+        if (!file.isFile || file.length() == 0L) {
+            throw ChatFailure("录音文件为空，请按住麦克风再说一次")
+        }
+        var lastFailure: ChatFailure? = null
+        val bases = candidateBases(provider.baseUrl)
+        for ((index, base) in bases.withIndex()) {
+            val request = buildTranscriptionRequest(base, provider, apiKey, modelId, file)
+            try {
+                clients.standard.newCall(request).execute().use { response ->
+                    val raw = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        lastFailure = if (response.code == 404) {
+                            ChatFailure(
+                                "当前 API 配置不支持语音转写（/audio/transcriptions 返回 404），请检查语音转写模型",
+                                httpCode = 404,
+                            )
+                        } else {
+                            ErrorMapper.fromHttp(response.code, raw)
+                        }
+                        if (response.code == 404 && index < bases.lastIndex) {
+                            throw RetryNextBase
+                        }
+                        throw lastFailure
+                    }
+                    val text = parseTranscription(raw)
+                    if (text.isBlank()) {
+                        throw ChatFailure("语音转写没有返回文字，可能该模型不支持录音格式")
+                    }
+                    return@withContext text
+                }
+            } catch (retry: RetryNextBase) {
+                continue
+            } catch (t: Throwable) {
+                if (t is ChatFailure) throw t
+                throw ErrorMapper.fromException(t)
+            }
+        }
+        throw lastFailure ?: ChatFailure("语音转写失败，请稍后重试")
+    }
+
+    private fun buildTranscriptionRequest(
+        baseUrl: String,
+        provider: Provider,
+        apiKey: String?,
+        modelId: String,
+        file: File,
+    ): Request {
+        // Omit response_format: OpenAI defaults to JSON and some compatible
+// providers reject the extra field.
+        val body = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("model", modelId)
+            .addFormDataPart("file", "voice.m4a", file.asRequestBody("audio/mp4".toMediaType()))
+            .build()
+        val builder = Request.Builder()
+            .url(UrlNormalizer.endpoint(baseUrl, "audio/transcriptions"))
+            .header("Accept", "application/json")
+            .post(body)
+        applyAuthAndHeaders(builder, provider, apiKey)
+        return builder.build()
+    }
+
+    private fun parseTranscription(raw: String): String {
+        val fromJson = runCatching {
+            json.parseToJsonElement(raw).jsonObject["text"]?.jsonPrimitive?.contentOrNull
+        }.getOrNull()
+        if (!fromJson.isNullOrBlank()) return fromJson.trim()
+        val trimmed = raw.trim()
+        return if (trimmed.startsWith("{")) "" else trimmed
+    }
+
+    private fun encodeImageDataUrl(image: PromptImage): String? = runCatching {
+        val file = File(image.path)
+        if (!file.isFile || file.length() <= 0L || file.length() > TextLimits.MAX_IMAGE_BYTES) {
+            return@runCatching null
+        }
+        val mime = image.mime.takeIf { it.startsWith("image/") } ?: "image/jpeg"
+        "data:$mime;base64," + Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)
+    }.getOrNull()
+
     private suspend fun FlowCollector<StreamEvent>.consumeSse(parser: SseParser) {
         var finishReason: String? = null
         while (true) {
@@ -252,6 +355,7 @@ class OpenAiChatClient(
         modelId: String,
         messages: List<PromptMessage>,
         includeUsage: Boolean,
+        imageDataUrl: (PromptImage) -> String?,
     ): Request {
         val payload = buildJsonObject {
             put("model", modelId)
@@ -259,7 +363,33 @@ class OpenAiChatClient(
                 messages.forEach { message ->
                     addJsonObject {
                         put("role", message.role)
-                        put("content", message.content)
+                        if (message.images.isEmpty()) {
+                            put("content", message.content)
+                        } else {
+                            putJsonArray("content") {
+                                if (message.content.isNotBlank()) {
+                                    addJsonObject {
+                                        put("type", "text")
+                                        put("text", message.content)
+                                    }
+                                }
+                                var attached = 0
+                                message.images.forEach { image ->
+                                    val url = imageDataUrl(image) ?: return@forEach
+                                    addJsonObject {
+                                        put("type", "image_url")
+                                        putJsonObject("image_url") { put("url", url) }
+                                    }
+                                    attached++
+                                }
+                                if (message.content.isBlank() && attached == 0) {
+                                    addJsonObject {
+                                        put("type", "text")
+                                        put("text", "[图片无法读取]")
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

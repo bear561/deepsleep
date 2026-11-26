@@ -241,6 +241,20 @@ fun ProviderEditScreen(
             }
 
             item {
+                OutlinedTextField(
+                    value = state.transcriptionModelId,
+                    onValueChange = { value -> viewModel.update { it.copy(transcriptionModelId = value) } },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("语音转写模型（可选）") },
+                    placeholder = { Text("whisper-1 / FunAudioLLM/SenseVoiceSmall") },
+                    singleLine = true,
+                    supportingText = {
+                        Text("用于系统没有语音识别服务的机型（如 vivo）。需要服务商支持 /audio/transcriptions；DeepSeek 官方不支持。")
+                    },
+                )
+            }
+
+            item {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
